@@ -1,0 +1,15 @@
+# Railway.toml - Railway deployment configuration
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "gunicorn app:app"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[env]
+# Bu değişkenler Railway dashboard'dan ayarlanacak
+# SECRET_KEY=
+# DATABASE_URL=
+# FLASK_ENV=production
