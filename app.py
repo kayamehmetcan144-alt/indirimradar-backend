@@ -507,14 +507,10 @@ def index():
 
 # ==================== RUN ====================
 
-if __name__ == '__main__':
-    # Initialize database on first run
+    with app.app_context():
     init_db()
-    
-    # Get port from environment variable (Railway provides this)
+    if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    
-    # Run app
     is_production = os.getenv('FLASK_ENV') == 'production'
     app.run(
         debug=not is_production,
