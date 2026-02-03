@@ -1,12 +1,16 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text  # SQLAlchemy 2.0 uyumluluğu için
+from werkzeug.security import generate_password_hash, check_password_hash # Importlar tepeye taşındı
 from datetime import datetime, timedelta
+from functools import wraps
 import jwt
 import os
-from functools import wraps
 
 app = Flask(__name__)
+
+# ==================== CONFIGURATION ====================
 
 # CORS Configuration - Allow specific origins
 allowed_origins = os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000').split(',')
@@ -14,13 +18,14 @@ CORS(app, origins=allowed_origins)
 
 # Configuration - Use environment variables
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
+# JWT için ayrı bir key kullanımı daha güvenlidir, yoksa SECRET_KEY kullanılır
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', app.config['SECRET_KEY'])
 
 # Database Configuration - Support both SQLite (dev) and PostgreSQL (production)
 database_url = os.getenv('DATABASE_URL', 'sqlite:///indirimradar.db')
 
 # Fix for Railway PostgreSQL URL (postgres:// -> postgresql://)
-if database_url.startswith('postgres://'):
+if database_url and database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
@@ -39,7 +44,9 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
     is_premium = db.Column(db.Boolean, default=False)
+    is_admin = db.Column(db.Boolean, default=False) # Admin kontrolü eklendi
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # backref isim çakışmalarını önlemek için back_populates kullanımı önerilir ama şimdilik basit tutuyoruz
     favorites = db.relationship('Favorite', backref='user', lazy=True)
     alerts = db.relationship('PriceAlert', backref='user', lazy=True)
 
@@ -90,13 +97,32 @@ def token_required(f):
         
         try:
             token = token.replace('Bearer ', '')
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            # JWT_SECRET_KEY kullanımı standartlaştırıldı
+            data = jwt.decode(token, app.config['JWT_SECRET_KEY'], algorithms=["HS256"])
             current_user = User.query.get(data['user_id'])
-        except:
+            
+            # GÜVENLİK DÜZELTMESİ: Kullanıcı silinmişse kontrol et
+            if not current_user:
+                return jsonify({'message': 'User invalid or deleted'}), 401
+                
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
             return jsonify({'message': 'Token is invalid'}), 401
+        except Exception as e:
+            return jsonify({'message': 'Authentication error', 'error': str(e)}), 401
         
         return f(current_user, *args, **kwargs)
     
+    return decorated
+
+# Basit bir admin decorator örneği (İleride kullanılabilir)
+def admin_required(f):
+    @wraps(f)
+    def decorated(current_user, *args, **kwargs):
+        if not current_user.is_admin:
+            return jsonify({'message': 'Admin privileges required'}), 403
+        return f(current_user, *args, **kwargs)
     return decorated
 
 # ==================== AUTH ROUTES ====================
@@ -105,10 +131,11 @@ def token_required(f):
 def register():
     data = request.get_json()
     
+    if not data or not data.get('email') or not data.get('password'):
+        return jsonify({'message': 'Missing email or password'}), 400
+    
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'message': 'User already exists'}), 400
-    
-    from werkzeug.security import generate_password_hash
     
     new_user = User(
         email=data['email'],
@@ -121,7 +148,7 @@ def register():
     token = jwt.encode({
         'user_id': new_user.id,
         'exp': datetime.utcnow() + timedelta(days=30)
-    }, app.config['SECRET_KEY'], algorithm="HS256")
+    }, app.config['JWT_SECRET_KEY'], algorithm="HS256")
     
     return jsonify({
         'token': token,
@@ -135,12 +162,14 @@ def register():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.get_json()
+    
+    if not data or not data.get('email') or not data.get('password'):
+        return jsonify({'message': 'Missing email or password'}), 400
+
     user = User.query.filter_by(email=data['email']).first()
     
     if not user:
         return jsonify({'message': 'Invalid credentials'}), 401
-    
-    from werkzeug.security import check_password_hash
     
     if not check_password_hash(user.password, data['password']):
         return jsonify({'message': 'Invalid credentials'}), 401
@@ -148,7 +177,7 @@ def login():
     token = jwt.encode({
         'user_id': user.id,
         'exp': datetime.utcnow() + timedelta(days=30)
-    }, app.config['SECRET_KEY'], algorithm="HS256")
+    }, app.config['JWT_SECRET_KEY'], algorithm="HS256")
     
     return jsonify({
         'token': token,
@@ -228,8 +257,13 @@ def get_product(product_id):
 @app.route('/api/favorites', methods=['GET'])
 @token_required
 def get_favorites(current_user):
+    # Performance Optimization: Join kullanilabilir ama basitlik için şimdilik böyle
     favorites = Favorite.query.filter_by(user_id=current_user.id).all()
     product_ids = [f.product_id for f in favorites]
+    
+    if not product_ids:
+        return jsonify({'favorites': []})
+
     products = Product.query.filter(Product.id.in_(product_ids)).all()
     
     return jsonify({
@@ -251,7 +285,10 @@ def get_favorites(current_user):
 @token_required
 def add_favorite(current_user):
     data = request.get_json()
-    product_id = data['product_id']
+    product_id = data.get('product_id')
+    
+    if not product_id:
+        return jsonify({'message': 'Product ID required'}), 400
     
     # Check if already favorited
     existing = Favorite.query.filter_by(user_id=current_user.id, product_id=product_id).first()
@@ -282,11 +319,14 @@ def remove_favorite(current_user, product_id):
 @app.route('/api/alerts', methods=['GET'])
 @token_required
 def get_alerts(current_user):
-    alerts = PriceAlert.query.filter_by(user_id=current_user.id, is_active=True).all()
+    # PERFORMANS DÜZELTMESİ: N+1 Problemi giderildi.
+    # Tek sorguda hem alarmı hem de ürün bilgisini çekiyoruz.
+    results = db.session.query(PriceAlert, Product).\
+        join(Product, PriceAlert.product_id == Product.id).\
+        filter(PriceAlert.user_id == current_user.id, PriceAlert.is_active == True).all()
     
     result = []
-    for alert in alerts:
-        product = Product.query.get(alert.product_id)
+    for alert, product in results:
         result.append({
             'id': alert.id,
             'target_price': alert.target_price,
@@ -304,11 +344,16 @@ def get_alerts(current_user):
 @token_required
 def create_alert(current_user):
     data = request.get_json()
+    product_id = data.get('product_id')
+    target_price = data.get('target_price')
+
+    if not product_id or target_price is None:
+        return jsonify({'message': 'Product ID and target price required'}), 400
     
     alert = PriceAlert(
         user_id=current_user.id,
-        product_id=data['product_id'],
-        target_price=data['target_price']
+        product_id=product_id,
+        target_price=target_price
     )
     
     db.session.add(alert)
@@ -345,9 +390,9 @@ def get_stats():
 
 # ==================== ADMIN ROUTES ====================
 
+# NOT: Prodüksiyon ortamında bu rotalara @admin_required (yukarıda tanımlı) eklenmelidir.
 @app.route('/api/admin/products', methods=['POST'])
 def admin_create_product():
-    # In production, add admin authentication
     data = request.get_json()
     
     product = Product(
@@ -392,9 +437,10 @@ def admin_update_product(product_id):
             # Check alerts
             alerts = PriceAlert.query.filter_by(product_id=product_id, is_active=True).all()
             for alert in alerts:
+                # Fiyat hedef fiyatın altına düştüyse veya eşitse
                 if data['current_price'] <= alert.target_price:
                     # In production, send notification here
-                    print(f"Alert triggered for user {alert.user_id}")
+                    print(f"!!! ALERT TRIGGERED for user {alert.user_id} on product {product.title}")
     
     if 'real_deal_status' in data:
         product.real_deal_status = data['real_deal_status']
@@ -475,8 +521,8 @@ def init_db():
 def health_check():
     """Health check endpoint for monitoring"""
     try:
-        # Check database connection
-        db.session.execute('SELECT 1')
+        # Check database connection (SQLAlchemy 2.0 compatible)
+        db.session.execute(text('SELECT 1'))
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
@@ -495,7 +541,7 @@ def index():
     """Root endpoint"""
     return jsonify({
         'message': '🔥 İndirimRadar API',
-        'version': '1.0.0',
+        'version': '1.0.1', # Versiyon güncellendi
         'status': 'running',
         'endpoints': {
             'health': '/health',
@@ -507,13 +553,17 @@ def index():
 
 # ==================== RUN ====================
 
-with app.app_context()init_db()
-
 if __name__ == '__main__':
+    # Initialize database on first run
+    init_db()
+    
+    # Get port from environment variable
     port = int(os.getenv('PORT', 5000))
+    
+    # Run app
     is_production = os.getenv('FLASK_ENV') == 'production'
     app.run(
         debug=not is_production,
         host='0.0.0.0',
         port=port
-                      )
+    )
