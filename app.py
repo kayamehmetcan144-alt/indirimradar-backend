@@ -507,13 +507,13 @@ def index():
 
 # ==================== RUN ====================
 
-    with app.app_context():
-    init_db()
-    if __name__ == '__main__':
+with app.app_context()init_db()
+
+if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     is_production = os.getenv('FLASK_ENV') == 'production'
     app.run(
         debug=not is_production,
         host='0.0.0.0',
         port=port
-    )
+                      )
